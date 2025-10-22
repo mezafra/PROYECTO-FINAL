@@ -61,29 +61,23 @@ st.line_chart(hist['Close'], use_container_width=True)
 window = 14
 delta = hist['Close'].diff()
 
-# ganancias y pérdidas
 gain = delta.clip(lower=0)
 loss = -delta.clip(upper=0)
 
-# Promedios tipo Wilder usando EWM (alpha = 1/window, adjust=False)
 avg_gain = gain.ewm(alpha=1/window, adjust=False, min_periods=window).mean()
 avg_loss = loss.ewm(alpha=1/window, adjust=False, min_periods=window).mean()
 
-# evitar división por cero
 rs = avg_gain / avg_loss
 rsi = 100 - (100 / (1 + rs))
 
-# Manejo de casos extremos:
-# cuando avg_loss == 0 => RSI = 100 (máximo), cuando avg_gain == 0 y avg_loss>0 => RSI=0
 rsi_filled = rsi.copy()
-rsi_filled = rsi_filled.fillna(50)  # valores iniciales neutrales
+rsi_filled = rsi_filled.fillna(50)
 rsi_filled.loc[avg_loss == 0] = 100
 rsi_filled.loc[(avg_gain == 0) & (avg_loss > 0)] = 0
 
 hist['RSI'] = rsi_filled
 rsi_actual = hist['RSI'].iloc[-1]
 
-# Interpretación del RSI
 if rsi_actual > 70:
     decision_rsi = f"RSI={rsi_actual:.2f} → **Sobrecompra. Riesgo de corrección. No invertir.**"
     rsi_signal = -1
@@ -95,25 +89,17 @@ else:
     rsi_signal = 0
 
 # -----------------------------------------------------
-# 📊 GRÁFICO DEL RSI MEJORADO (CORREGIDO)
+# 📊 GRÁFICO DEL RSI
 # -----------------------------------------------------
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9,6), sharex=True)
-
-# Precio histórico
 ax1.plot(hist['Close'], color='steelblue', linewidth=2)
 ax1.set_title(f'Precio histórico de {ticker}')
 ax1.set_ylabel('Precio (USD)')
 
-# RSI: línea + banda 30-70 + resaltados de sobrecompra/sobreventa
 ax2.plot(hist.index, hist['RSI'], color='#FFA500', label=f'RSI ({window} días)', linewidth=1.5)
-
-# Banda neutral sombreada (30 a 70)
 ax2.fill_between(hist.index, 30, 70, color='purple', alpha=0.08)
-
-# Resaltado de zonas extremas (opcional)
 ax2.fill_between(hist.index, hist['RSI'], 70, where=(hist['RSI'] >= 70), color='red', alpha=0.25, interpolate=True)
 ax2.fill_between(hist.index, hist['RSI'], 30, where=(hist['RSI'] <= 30), color='green', alpha=0.25, interpolate=True)
-
 ax2.axhline(70, color='red', linestyle='--', linewidth=1)
 ax2.axhline(30, color='green', linestyle='--', linewidth=1)
 ax2.set_title('Índice RSI (14 días)')
@@ -200,6 +186,65 @@ st.write(decision_stoc)
 st.write(f"📉 Volatilidad histórica anual: **{vol_hist:.2f}%**")
 st.markdown(f"### 🔎 Conclusión final: {final}")
 
-# Precio esperado
 st.metric(label=f"💰 Precio actual de {ticker}", value=f"${S0:.2f}")
 st.metric(label=f"📈 Precio esperado en {horizonte}", value=f"${precio_esperado:.2f}", delta=f"{variacion:.2f}%")
+
+# -----------------------------------------------------
+# 🧾 CADENA DE OPCIONES (MODIFICADA PARA 2 CALL + 2 PUT)
+# -----------------------------------------------------
+st.markdown("---")
+st.subheader("🧾 Cadena de opciones y recomendación")
+
+try:
+    expirations = data.options
+except Exception:
+    expirations = []
+    st.warning("No se pudieron obtener las expiraciones de opciones desde Yahoo Finance.")
+
+if not expirations:
+    st.info("No hay cadena de opciones disponible para este ticker o Yahoo no devuelve expiraciones.")
+else:
+    exp_choice = st.selectbox("Seleccione fecha de vencimiento", expirations, index=0)
+
+    try:
+        chain = data.option_chain(exp_choice)
+        calls = chain.calls.copy()
+        puts = chain.puts.copy()
+    except Exception:
+        st.error("Error al descargar la cadena de opciones para la expiración seleccionada.")
+        calls = pd.DataFrame()
+        puts = pd.DataFrame()
+
+    if not calls.empty or not puts.empty:
+        if not calls.empty:
+            calls = calls.assign(type='call')
+        if not puts.empty:
+            puts = puts.assign(type='put')
+
+        options = pd.concat([calls, puts], ignore_index=True, sort=False)
+        options['dist_to_pred'] = (options['strike'] - precio_esperado).abs()
+
+        # 🔹 Mostrar las 2 CALL y 2 PUT más cercanas
+        closest_calls = calls.assign(dist_to_pred=(calls['strike'] - precio_esperado).abs()).sort_values('dist_to_pred').head(2)
+        closest_puts = puts.assign(dist_to_pred=(puts['strike'] - precio_esperado).abs()).sort_values('dist_to_pred').head(2)
+        options_sorted = pd.concat([closest_calls, closest_puts])
+
+        st.markdown("**Opciones cuyos strikes están más cercanos al precio predicho:**")
+        st.dataframe(options_sorted[['type', 'strike', 'lastPrice', 'dist_to_pred']])
+
+        # 🔹 Selección interactiva
+        choice_map = {f"{row['type'].upper()} (strike {row['strike']})": row for _, row in options_sorted.iterrows()}
+        sel_key = st.selectbox("Selecciona qué opción simular la ejecución", list(choice_map.keys()))
+        option_to_trade = choice_map[sel_key]
+
+        qty = st.number_input("Cantidad de contratos", 1, 100, 1)
+        action = st.selectbox("Acción simulada", ["Comprar (Long)", "Vender (Short)"])
+
+        st.markdown("**Resumen de la orden simulada**")
+        st.write(f"Ticker: **{ticker}**, Tipo: **{option_to_trade['type']}**, Strike: **{option_to_trade['strike']}**")
+        st.write(f"Prima: {option_to_trade.get('lastPrice', np.nan)} USD")
+        st.write(f"Acción: {action} | Cantidad: {qty}")
+
+        if st.button("Ejecutar orden simulada"):
+            notional = qty * 100 * (option_to_trade['lastPrice'] if not np.isnan(option_to_trade['lastPrice']) else 0)
+            st.success(f"Orden simulada: {action} {qty} contratos de {option_to_trade['type']} strike {option_to_trade['strike']} por aprox. ${notional:,.2f}")
